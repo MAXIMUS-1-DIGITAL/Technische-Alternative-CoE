@@ -1,9 +1,11 @@
 """CoE state observer to track state changes."""
 
 from homeassistant.const import ATTR_UNIT_OF_MEASUREMENT, STATE_ON
-from homeassistant.core import Event, HomeAssistant, State, callback
-from homeassistant.helpers.event import async_track_state_change_event
-from ta_cmi import CoE
+from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, State, callback
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from ta_cmi import ApiError, CoE
+
+RESEND_DELAY = 5
 
 from .const import (
     ANALOG_DOMAINS,
@@ -40,14 +42,39 @@ class StateObserver:
         ]
 
         self._states = {TYPE_BINARY: {}, TYPE_SENSOR: {}}
+        self._cancel_resend: CALLBACK_TYPE | None = None
 
         self._unsubscribe = async_track_state_change_event(
             self._hass, self._entity_list, self._update_listener
         )
 
     def unload(self) -> None:
-        """Remove the state change listener."""
+        """Remove the state change listener and a pending resend."""
         self._unsubscribe()
+        if self._cancel_resend is not None:
+            self._cancel_resend()
+            self._cancel_resend = None
+
+    @callback
+    def _schedule_resend(self, err: ApiError) -> None:
+        """Resend all values once after a short delay."""
+        _LOGGER.warning(
+            "Sending to the CoE server failed, resend in %s s: %s", RESEND_DELAY, err
+        )
+        if self._cancel_resend is not None:
+            return
+        self._cancel_resend = async_call_later(self._hass, RESEND_DELAY, self._resend)
+
+    async def _resend(self, _now) -> None:
+        """Send all values after a failed send."""
+        self._cancel_resend = None
+        try:
+            await self._sender.update()
+        except ApiError as err:
+            _LOGGER.warning(
+                "Resend to the CoE server failed, next try with the periodic refresh: %s",
+                err,
+            )
 
     @staticmethod
     def _is_state_valid(state: str) -> bool:
@@ -87,7 +114,10 @@ class StateObserver:
                 self._states[TYPE_BINARY][entity_id] = state_value
                 self._sender.update_digital_manuel(entity_id, state_value)
 
-        await self._sender.update()
+        try:
+            await self._sender.update()
+        except ApiError as err:
+            self._schedule_resend(err)
 
     @callback
     async def _update_listener(self, event: Event) -> None:
@@ -103,19 +133,22 @@ class StateObserver:
 
         _LOGGER.debug(f"Handle new state {new_state.entity_id}: {new_state.state}")
 
-        if new_state.domain in ANALOG_DOMAINS:
-            state_value = float(new_state.state)
+        try:
+            if new_state.domain in ANALOG_DOMAINS:
+                state_value = float(new_state.state)
 
-            self._states[TYPE_SENSOR][new_state.entity_id] = state_value
+                self._states[TYPE_SENSOR][new_state.entity_id] = state_value
 
-            await self._sender.update_analog(
-                new_state.entity_id,
-                state_value,
-                str(new_state.attributes.get(ATTR_UNIT_OF_MEASUREMENT, "")),
-            )
+                await self._sender.update_analog(
+                    new_state.entity_id,
+                    state_value,
+                    str(new_state.attributes.get(ATTR_UNIT_OF_MEASUREMENT, "")),
+                )
 
-        if new_state.domain in DIGITAL_DOMAINS:
-            state_value = new_state.state is STATE_ON
-            self._states[TYPE_BINARY][new_state.entity_id] = state_value
+            if new_state.domain in DIGITAL_DOMAINS:
+                state_value = new_state.state is STATE_ON
+                self._states[TYPE_BINARY][new_state.entity_id] = state_value
 
-            await self._sender.update_digital(new_state.entity_id, state_value)
+                await self._sender.update_digital(new_state.entity_id, state_value)
+        except ApiError as err:
+            self._schedule_resend(err)
